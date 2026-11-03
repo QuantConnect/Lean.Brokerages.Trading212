@@ -15,8 +15,8 @@ jobs:
         image: quantconnect/lean:foundation
         options: --cpus 12 --memory 12g
         env:
-          QC_TEMPLATE_BROKERAGE_KEY: ${{ secrets.QC_TEMPLATE_BROKERAGE_KEY }}
-          QC_TEMPLATE_BROKERAGE_SECRET: ${{ secrets.QC_TEMPLATE_BROKERAGE_SECRET }}
+          QC_TRADING212_BROKERAGE_KEY: ${{ secrets.QC_TRADING212_BROKERAGE_KEY }}
+          QC_TRADING212_BROKERAGE_SECRET: ${{ secrets.QC_TRADING212_BROKERAGE_SECRET }}
           QC_JOB_USER_ID: ${{ secrets.QC_JOB_USER_ID }}
           QC_API_ACCESS_TOKEN: ${{ secrets.QC_API_ACCESS_TOKEN }}
           QC_JOB_ORGANIZATION_ID: ${{ secrets.QC_JOB_ORGANIZATION_ID }}
@@ -24,20 +24,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v2
 
-      - name: Checkout Lean Same Branch
-        id: lean-same-branch
-        uses: actions/checkout@v2
-        continue-on-error: true
-        with:
-          ref: ${{ github.head_ref || github.ref_name }}
-          repository: QuantConnect/Lean
-          path: Lean
-
-      - name: Checkout Lean Master
-        if: steps.lean-same-branch.outcome != 'success'
+      # The released Lean does not contain Trading212BrokerageModel yet, so the build is pinned to the
+      # fork branch that adds it (QuantConnect/Lean#9982, stacked on #9983 and #9985).
+      # TODO: switch this to `repository: QuantConnect/Lean`, `ref: master` once #9982 is merged.
+      - name: Checkout Lean
         uses: actions/checkout@v2
         with:
-          repository: QuantConnect/Lean
+          repository: nimakalantar/Lean
+          ref: feature-9981-trading212-settlement-model
           path: Lean
 
       - name: Move Lean
@@ -46,7 +40,7 @@ jobs:
       - name: Run build and tests
         run: |
           # Build
-          dotnet build /p:Configuration=Release /v:quiet /p:WarningLevel=1 QuantConnect.TemplateBrokerage.sln && \
+          dotnet build /p:Configuration=Release /v:quiet /p:WarningLevel=1 QuantConnect.Trading212Brokerage.sln && \
           # Run Tests
-          dotnet test ./QuantConnect.TemplateBrokerage.Tests/bin/Release/QuantConnect.Brokerages.Template.Tests.dll
+          dotnet test ./QuantConnect.Trading212Brokerage.Tests/bin/Release/QuantConnect.Brokerages.Trading212.Tests.dll
 
