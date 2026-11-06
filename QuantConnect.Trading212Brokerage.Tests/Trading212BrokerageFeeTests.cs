@@ -14,12 +14,14 @@
 */
 
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Net;
 using NUnit.Framework;
 using QuantConnect.Brokerages.Trading212.Api;
+using QuantConnect.Brokerages.Trading212.Models;
 using QuantConnect.Orders;
 using QuantConnect.Orders.Fees;
-using QuantConnect.Securities;
 
 namespace QuantConnect.Brokerages.Trading212.Tests
 {
@@ -27,9 +29,9 @@ namespace QuantConnect.Brokerages.Trading212.Tests
     /// Covers the order fee the brokerage reports on a fill.
     /// </summary>
     /// <remarks>
-    /// Trading 212 reports no commission, but a trade is not free: there is an FX fee on the converted notional
-    /// and, on US sales, the regulatory fees. Those are modelled by <c>Trading212FeeModel</c>, which this plugin
-    /// reuses so a live fill is priced the same way a backtest is.
+    /// Trading 212 reports no commission, but a trade is not free: the history endpoint's fill carries the
+    /// taxes that were actually charged in <c>walletImpact.taxes</c>. Those are reported as they are, so a
+    /// live fill carries the broker's real cost rather than a model of it.
     /// </remarks>
     [TestFixture]
     public class Trading212BrokerageFeeTests
@@ -37,7 +39,7 @@ namespace QuantConnect.Brokerages.Trading212.Tests
         private static readonly Symbol Apple = Symbol.Create("AAPL", SecurityType.Equity, Market.USA);
 
         private FakeHttpMessageHandler _handler;
-        private FakeSecurityProvider _securityProvider;
+        private FakeOrderProvider _orderProvider;
         private Trading212Brokerage _brokerage;
 
         [SetUp]
@@ -48,9 +50,9 @@ namespace QuantConnect.Brokerages.Trading212.Tests
             _handler.EnqueueJson(HttpStatusCode.OK, Trading212TestData.Instruments);
             _handler.EnqueueJson(HttpStatusCode.OK, Trading212TestData.EmptyArray);
 
-            _securityProvider = new FakeSecurityProvider();
+            _orderProvider = new FakeOrderProvider();
             var client = new Trading212ApiClient("https://demo.trading212.com", "key", "secret", _handler, messageReceived: null);
-            _brokerage = new Trading212Brokerage(client, orderProvider: null, securityProvider: _securityProvider);
+            _brokerage = new Trading212Brokerage(client, _orderProvider);
             _brokerage.Connect();
         }
 
@@ -62,67 +64,100 @@ namespace QuantConnect.Brokerages.Trading212.Tests
         }
 
         [Test]
-        public void ChargesTheFxFeeOnAForeignCurrencyBuy()
+        public void ChargesTheFeesTheBrokerReported()
         {
-            // The account is GBP and the instrument is USD, so the FX fee applies.
+            // The account is GBP, so a USD tax is converted with the fill's FX rate while a GBP tax is not.
             Assert.That(_brokerage.AccountCurrency, Is.EqualTo("GBP"));
-            _securityProvider.AddEquity(Apple, Currencies.USD);
 
+            var fee = _brokerage.GetOrderFee(OrderStatus.Filled, FillWithTaxes(
+                ("FX fee", "USD", 0.15m),
+                ("PTM levy", "GBP", 0.01m)));
+
+            Assert.That(fee.Value.Amount, Is.EqualTo(0.15m * 0.79m + 0.01m).Within(0.000001m));
+            Assert.That(fee.Value.Currency, Is.EqualTo(Currencies.GBP));
+        }
+
+        [Test]
+        public void ReportsABrokerFeeInTheAccountCurrency()
+        {
+            var fill = FillWithTaxes(("SEC fee", "GBP", 0.23m));
+
+            Assert.That(_brokerage.GetOrderFee(OrderStatus.Filled, fill).Value.Currency, Is.EqualTo(Currencies.GBP));
+        }
+
+        [Test]
+        public void ChargesNothingWhenTheFillCarriesNoTaxes()
+        {
+            var fill = new Trading212Fill
+            {
+                Price = 100m,
+                Quantity = 1m,
+                WalletImpact = new Trading212FillWalletImpact { Currency = "USD", FxRate = 0.79m }
+            };
+
+            Assert.That(_brokerage.GetOrderFee(OrderStatus.Filled, fill), Is.EqualTo(OrderFee.Zero));
+        }
+
+        [Test]
+        public void ChargesNothingWithoutAFill()
+        {
+            Assert.That(_brokerage.GetOrderFee(OrderStatus.Filled, fill: null), Is.EqualTo(OrderFee.Zero));
+            Assert.That(_brokerage.GetOrderFee(OrderStatus.Submitted, FillWithTaxes(("FX fee", "USD", 0.15m))), Is.EqualTo(OrderFee.Zero));
+            Assert.That(_brokerage.GetOrderFee(OrderStatus.PartiallyFilled, FillWithTaxes(("FX fee", "USD", 0.15m))), Is.EqualTo(OrderFee.Zero));
+        }
+
+        [Test]
+        public void ReportsTheBrokerFeeOnTheFilledOrderEvent()
+        {
             var order = new MarketOrder(Apple, 1m, DateTime.UtcNow);
-            var fee = _brokerage.GetOrderFee(order, OrderStatus.Filled, fillPrice: 100m);
+            order.BrokerId.Add("950");
+            _orderProvider.Add(order);
 
-            Assert.That(fee.Value.Amount, Is.GreaterThan(0m), "A USD buy in a GBP account must pay the FX fee.");
-            // 0.15% of the 100.00 notional, computed in the instrument's quote currency.
-            Assert.That(fee.Value.Amount, Is.EqualTo(0.15m).Within(0.0001m));
-            Assert.That(fee.Value.Currency, Is.EqualTo(Currencies.USD));
-            // The fee is applied to the portfolio in the account currency, so it never leaves a USD balance.
-            Assert.That(fee, Is.InstanceOf<AccountCurrencyOrderFee>());
+            var events = new List<OrderEvent>();
+            _brokerage.OrdersStatusChanged += (_, orderEvents) => events.AddRange(orderEvents);
+
+            _brokerage.ApplyBrokerageOrder(new Trading212Order
+            {
+                Id = 950,
+                Ticker = "AAPL_US_EQ",
+                Type = Trading212OrderType.Market,
+                Status = Trading212OrderStatus.Filled,
+                Side = Trading212OrderSide.Buy,
+                Quantity = 1m,
+                FilledQuantity = 1m
+            }, FillWithTaxes(("FX fee", "USD", 0.15m), ("SEC fee", "GBP", 0.02m)));
+
+            var orderEvent = events.Single();
+            Assert.That(orderEvent.Status, Is.EqualTo(OrderStatus.Filled));
+            Assert.That(orderEvent.OrderFee.Value.Amount, Is.EqualTo(0.15m * 0.79m + 0.02m).Within(0.000001m));
+            Assert.That(orderEvent.OrderFee.Value.Currency, Is.EqualTo(Currencies.GBP));
         }
 
-        [Test]
-        public void ChargesTheRegulatoryFeesOnAUsSale()
+        /// <summary>
+        /// Builds a fill that carries the given taxes.
+        /// </summary>
+        /// <param name="taxes">The name, currency and amount of each tax.</param>
+        /// <returns>The fill.</returns>
+        private static Trading212Fill FillWithTaxes(params (string Name, string Currency, decimal Amount)[] taxes)
         {
-            _securityProvider.AddEquity(Apple, Currencies.USD);
+            var fill = new Trading212Fill
+            {
+                Price = 100m,
+                Quantity = 1m,
+                WalletImpact = new Trading212FillWalletImpact
+                {
+                    Currency = "USD",
+                    FxRate = 0.79m,
+                    Taxes = new List<Trading212Tax>()
+                }
+            };
 
-            var order = new MarketOrder(Apple, 100m, DateTime.UtcNow);
-            var fee = _brokerage.GetOrderFee(order, OrderStatus.Filled, fillPrice: 100m);
+            foreach (var (name, currency, amount) in taxes)
+            {
+                fill.WalletImpact.Taxes.Add(new Trading212Tax { Name = name, Currency = currency, Quantity = amount });
+            }
 
-            // The FX fee applies to a sale too, and the SEC and FINRA fees are added on top.
-            Assert.That(fee.Value.Amount, Is.GreaterThan(0.15m), "A sale must also pay the regulatory fees.");
-        }
-
-        [Test]
-        public void ChargesNothingWhenTheOrderHasNotFilled()
-        {
-            _securityProvider.AddEquity(Apple, Currencies.USD);
-
-            var order = new MarketOrder(Apple, 1m, DateTime.UtcNow);
-
-            Assert.That(_brokerage.GetOrderFee(order, OrderStatus.Submitted, fillPrice: 0m), Is.EqualTo(OrderFee.Zero));
-            Assert.That(_brokerage.GetOrderFee(order, OrderStatus.PartiallyFilled, fillPrice: 100m), Is.EqualTo(OrderFee.Zero));
-        }
-
-        [Test]
-        public void ChargesNothingWhenTheSecurityIsUnknown()
-        {
-            // Without a security the fee model cannot be applied; the fill must still be reported.
-            var order = new MarketOrder(Apple, 1m, DateTime.UtcNow);
-
-            Assert.That(_brokerage.GetOrderFee(order, OrderStatus.Filled, fillPrice: 100m), Is.EqualTo(OrderFee.Zero));
-        }
-
-        [Test]
-        public void PricesAMarketFillFromTheTradedPrice()
-        {
-            // A security that no data feed has priced yet still has to produce a fee for a real fill.
-            var security = _securityProvider.AddEquity(Apple, Currencies.USD);
-            Assert.That(security.Price, Is.EqualTo(0m));
-
-            var fee = _brokerage.GetOrderFee(new MarketOrder(Apple, 10m, DateTime.UtcNow), OrderStatus.Filled, fillPrice: 50m);
-
-            Assert.That(security.Price, Is.EqualTo(50m), "the fill price should seed an unpriced security");
-            // 0.15% of 10 x 50.00.
-            Assert.That(fee.Value.Amount, Is.EqualTo(0.75m).Within(0.0001m));
+            return fill;
         }
     }
 }

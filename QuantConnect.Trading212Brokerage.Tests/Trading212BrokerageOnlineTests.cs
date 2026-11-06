@@ -37,10 +37,11 @@ namespace QuantConnect.Brokerages.Trading212.Tests
     /// CI. They require credentials; see <see cref="Trading212OnlineCredentials"/>.
     /// </para>
     /// <para>
-    /// The environment is selected with the <c>TRADING212_ENVIRONMENT</c> variable, <c>demo</c> (the default)
-    /// or <c>live</c>. The two environments use different API key pairs. Tests that place orders only run
-    /// against <c>demo</c>, because that is paper money; against <c>live</c> only the read-only checks and a
-    /// guaranteed broker rejection run.
+    /// The environment is selected with the <c>TRADING212_ENVIRONMENT</c> variable, <c>demo</c> or
+    /// <c>live</c>; these tests default to <c>demo</c> so an unset variable never reaches a real account. The
+    /// two environments use different API key pairs. Tests that place orders only run against <c>demo</c>,
+    /// because that is paper money; against <c>live</c> only the read-only checks and a guaranteed broker
+    /// rejection run.
     /// </para>
     /// <para>
     /// The API key is IP restricted, so the tests can only run from a host the key allows.
@@ -73,12 +74,6 @@ namespace QuantConnect.Brokerages.Trading212.Tests
         private FakeOrderProvider _orderProvider;
 
         /// <summary>
-        /// Supplies the securities the brokerage prices order fees against, which in LEAN is the algorithm's
-        /// portfolio.
-        /// </summary>
-        private FakeSecurityProvider _securityProvider;
-
-        /// <summary>
         /// The environment the tests run against.
         /// </summary>
         private Trading212Environment _environment;
@@ -88,10 +83,16 @@ namespace QuantConnect.Brokerages.Trading212.Tests
         /// </summary>
         public const string EnvironmentVariable = "TRADING212_ENVIRONMENT";
 
+        /// <summary>
+        /// The environment the tests use when the variable is unset.
+        /// </summary>
+        private const string DefaultEnvironment = "demo";
+
         [OneTimeSetUp]
         public void OneTimeSetUp()
         {
-            _environment = Trading212Brokerage.ParseEnvironment(Environment.GetEnvironmentVariable(EnvironmentVariable));
+            _environment = Trading212Brokerage.ParseEnvironment(
+                Environment.GetEnvironmentVariable(EnvironmentVariable) ?? DefaultEnvironment);
 
             if (!Trading212OnlineCredentials.IsConfigured(_environment))
             {
@@ -116,13 +117,7 @@ namespace QuantConnect.Brokerages.Trading212.Tests
             _apiClient = new Trading212ApiClient(apiKey, apiSecret, _environment, messageReceived: null);
 
             _orderProvider = new FakeOrderProvider();
-            _securityProvider = new FakeSecurityProvider();
-            _brokerage = new Trading212Brokerage(
-                apiKey,
-                apiSecret,
-                _environment,
-                orderProvider: _orderProvider,
-                securityProvider: _securityProvider);
+            _brokerage = new Trading212Brokerage(apiKey, apiSecret, _environment, _orderProvider);
 
             _brokerage.Connect();
         }
@@ -241,7 +236,6 @@ namespace QuantConnect.Brokerages.Trading212.Tests
             Assert.That(ticker, Is.Not.Null, "No tradable instrument was available to place an order on.");
 
             var symbol = _brokerage.SymbolMapper.GetLeanSymbol(ticker, SecurityType.Equity, Market.USA);
-            _securityProvider.AddEquity(symbol, GetInstrumentCurrency(ticker));
             var order = new MarketOrder(symbol, 1m, DateTime.UtcNow);
 
             var events = CaptureOrderEvents();
@@ -274,13 +268,10 @@ namespace QuantConnect.Brokerages.Trading212.Tests
             Assert.That(finalEvent.FillPrice, Is.GreaterThan(0m));
             Assert.That(finalEvent.FillQuantity, Is.GreaterThan(0m));
 
-            // The fill must carry a priced fee, not OrderFee.Zero: Trading 212 charges an FX fee on the
-            // converted notional and the US regulatory fees, which Trading212FeeModel computes.
-            Assert.That(finalEvent.OrderFee.Value.Amount, Is.GreaterThan(0m), "The fill reported a zero fee.");
-            // The fee is computed in the instrument's quote currency and applied to the portfolio in the
-            // account currency, so it never leaves a balance in the quote currency.
-            Assert.That(finalEvent.OrderFee, Is.InstanceOf<AccountCurrencyOrderFee>(),
-                "The fee must settle in the account currency.");
+            // The fee is what the broker charged, read from the fill's wallet impact, so it settles in the
+            // account currency and is never negative.
+            Assert.That(finalEvent.OrderFee.Value.Amount, Is.GreaterThanOrEqualTo(0m));
+            Assert.That(finalEvent.OrderFee.Value.Currency, Is.EqualTo(_brokerage.AccountBaseCurrency));
             Log.Trace($"Fee on a {GetInstrumentCurrency(ticker)} buy in a {_brokerage.AccountBaseCurrency} account: {finalEvent.OrderFee}");
 
             var holding = _brokerage.GetAccountHoldings().FirstOrDefault(holding => holding.Symbol == symbol);

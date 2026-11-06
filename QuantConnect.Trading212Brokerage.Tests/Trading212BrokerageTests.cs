@@ -346,12 +346,14 @@ namespace QuantConnect.Brokerages.Trading212.Tests
             var events = new List<OrderEvent>();
             brokerage.OrdersStatusChanged += (_, orderEvents) => events.AddRange(orderEvents);
 
-            // The broker reports a cumulative filled quantity; LEAN needs the incremental one.
+            // The broker reports a cumulative filled quantity; LEAN needs the incremental one. A pending order
+            // carries no execution price, only the cumulative filled value, so the price of each incremental
+            // fill is the change in value over the change in quantity.
             brokerage.ApplyBrokerageOrder(NewOrder(Trading212OrderStatus.New, 0m), fill: null);
-            brokerage.ApplyBrokerageOrder(NewOrder(Trading212OrderStatus.PartiallyFilled, 4m), new Trading212Fill { Price = 100m, Quantity = 4m });
+            brokerage.ApplyBrokerageOrder(NewOrder(Trading212OrderStatus.PartiallyFilled, 4m, filledValue: 400m), fill: null);
             // An unchanged poll must not produce another event.
-            brokerage.ApplyBrokerageOrder(NewOrder(Trading212OrderStatus.PartiallyFilled, 4m), new Trading212Fill { Price = 100m, Quantity = 4m });
-            brokerage.ApplyBrokerageOrder(NewOrder(Trading212OrderStatus.Filled, 10m), new Trading212Fill { Price = 101m, Quantity = 6m });
+            brokerage.ApplyBrokerageOrder(NewOrder(Trading212OrderStatus.PartiallyFilled, 4m, filledValue: 400m), fill: null);
+            brokerage.ApplyBrokerageOrder(NewOrder(Trading212OrderStatus.Filled, 10m, filledValue: 1010m), new Trading212Fill { Price = 101m, Quantity = 6m });
 
             Assert.That(events.Select(e => e.Status), Is.EqualTo(new[]
             {
@@ -360,8 +362,82 @@ namespace QuantConnect.Brokerages.Trading212.Tests
                 OrderStatus.Filled
             }));
             Assert.That(events.Select(e => e.FillQuantity), Is.EqualTo(new[] { 0m, 4m, 6m }));
-            Assert.That(events[1].FillPrice, Is.EqualTo(100m));
+            Assert.That(events[1].FillPrice, Is.EqualTo(100m), "a partial fill must be priced from filledValue, not reported at zero");
             Assert.That(events[2].FillPrice, Is.EqualTo(101m));
+        }
+
+        [Test]
+        public void ApplyBrokerageOrderPricesAPartialFillFromTheChangeInFilledValue()
+        {
+            var brokerage = CreateConnectedBrokerage();
+
+            var order = new MarketOrder(Apple, 10m, DateTime.UtcNow);
+            order.BrokerId.Add("903");
+            _orderProvider.Add(order);
+
+            var events = new List<OrderEvent>();
+            brokerage.OrdersStatusChanged += (_, orderEvents) => events.AddRange(orderEvents);
+
+            // The second fill is at a different price, so only the change in value applies to the new shares.
+            brokerage.ApplyBrokerageOrder(NewOrder(Trading212OrderStatus.PartiallyFilled, 2m, id: 903, filledValue: 200m), fill: null);
+            brokerage.ApplyBrokerageOrder(NewOrder(Trading212OrderStatus.PartiallyFilled, 5m, id: 903, filledValue: 530m), fill: null);
+
+            Assert.That(events.Select(e => e.FillQuantity), Is.EqualTo(new[] { 2m, 3m }));
+            Assert.That(events[0].FillPrice, Is.EqualTo(100m));
+            Assert.That(events[1].FillPrice, Is.EqualTo(110m), "3 shares filled for a further 330.00");
+            Assert.That(events.All(e => e.FillPrice > 0m), Is.True);
+        }
+
+        [Test]
+        public void PlaceOrderDoesNotPlaceTwiceWhenTheResponseIsAmbiguous()
+        {
+            var brokerage = CreateConnectedBrokerage();
+
+            // The placement request fails with a gateway error, then the broker reports the order it did create.
+            _handler.EnqueueJson(HttpStatusCode.GatewayTimeout, """{ "title": "upstream error" }""");
+            var createdAt = DateTime.UtcNow.AddMinutes(-1).ToString("yyyy-MM-ddTHH:mm:ssZ");
+            _handler.EnqueueJson(HttpStatusCode.OK, $$"""
+            [
+                { "id": 4242, "ticker": "AAPL_US_EQ", "type": "MARKET", "status": "NEW", "side": "BUY", "quantity": 1, "filledQuantity": 0, "createdAt": "{{createdAt}}" }
+            ]
+            """);
+
+            var events = new List<OrderEvent>();
+            brokerage.OrdersStatusChanged += (_, orderEvents) => events.AddRange(orderEvents);
+
+            var order = new MarketOrder(Apple, 1m, DateTime.UtcNow);
+            _orderProvider.Add(order);
+
+            Assert.That(brokerage.PlaceOrder(order), Is.True);
+
+            Assert.That(_handler.Requests.Count(request => request.Method == HttpMethod.Post), Is.EqualTo(1), "placement must not be retried");
+            Assert.That(order.BrokerId, Is.EqualTo(new List<string> { "4242" }));
+            Assert.That(events.Single().Status, Is.EqualTo(OrderStatus.Submitted));
+        }
+
+        [Test]
+        public void PlaceOrderReportsAnUnknownOutcomeWhenTheOrderCannotBeFound()
+        {
+            var brokerage = CreateConnectedBrokerage();
+
+            // The placement request fails and the broker holds no such order.
+            _handler.EnqueueJson(HttpStatusCode.BadGateway, """{ "title": "upstream error" }""");
+            _handler.EnqueueJson(HttpStatusCode.OK, Trading212TestData.EmptyArray);
+            _handler.EnqueueJson(HttpStatusCode.OK, Trading212TestData.EmptyPage);
+
+            var messages = new List<BrokerageMessageEvent>();
+            var events = new List<OrderEvent>();
+            brokerage.Message += (_, message) => messages.Add(message);
+            brokerage.OrdersStatusChanged += (_, orderEvents) => events.AddRange(orderEvents);
+
+            var order = new MarketOrder(Apple, 1m, DateTime.UtcNow);
+            _orderProvider.Add(order);
+
+            Assert.That(brokerage.PlaceOrder(order), Is.True);
+
+            Assert.That(events.Single().Status, Is.EqualTo(OrderStatus.Invalid));
+            Assert.That(order.BrokerId, Is.Empty);
+            Assert.That(messages.Single(message => message.Code == "OrderPlacementUnknown").Type, Is.EqualTo(BrokerageMessageType.Error));
         }
 
         [Test]
@@ -419,8 +495,9 @@ namespace QuantConnect.Brokerages.Trading212.Tests
         /// <param name="filledQuantity">The cumulative filled quantity.</param>
         /// <param name="id">The broker order id.</param>
         /// <param name="quantity">The order quantity.</param>
+        /// <param name="filledValue">The cumulative filled value, which the pending orders endpoint reports.</param>
         /// <returns>The broker order.</returns>
-        private static Trading212Order NewOrder(Trading212OrderStatus status, decimal filledQuantity, long id = 900, decimal quantity = 10m)
+        private static Trading212Order NewOrder(Trading212OrderStatus status, decimal filledQuantity, long id = 900, decimal quantity = 10m, decimal? filledValue = null)
         {
             return new Trading212Order
             {
@@ -430,7 +507,8 @@ namespace QuantConnect.Brokerages.Trading212.Tests
                 Status = status,
                 Side = quantity < 0 ? Trading212OrderSide.Sell : Trading212OrderSide.Buy,
                 Quantity = quantity,
-                FilledQuantity = filledQuantity
+                FilledQuantity = filledQuantity,
+                FilledValue = filledValue
             };
         }
     }

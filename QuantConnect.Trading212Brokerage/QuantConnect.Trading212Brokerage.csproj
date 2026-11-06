@@ -27,17 +27,6 @@
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Newtonsoft.Json" Version="13.0.2" />
-  </ItemGroup>
-  <!--
-    This plugin uses two types that LEAN has not released yet: Trading212BrokerageModel
-    (QuantConnect/Lean#9982) and Trading212FeeModel (QuantConnect/Lean#9983). When a LEAN checkout is
-    present the plugin builds against its source, which is how CI validates it; otherwise it falls back to
-    the released package. Drop the condition once LEAN ships a package containing those types.
-  -->
-  <ItemGroup Condition="Exists('$(MSBuildThisFileDirectory)..\..\Lean\Brokerages\QuantConnect.Brokerages.csproj')">
-    <ProjectReference Include="..\..\Lean\Brokerages\QuantConnect.Brokerages.csproj" />
-  </ItemGroup>
-  <ItemGroup Condition="!Exists('$(MSBuildThisFileDirectory)..\..\Lean\Brokerages\QuantConnect.Brokerages.csproj')">
     <PackageReference Include="QuantConnect.Brokerages" Version="2.5.*" />
   </ItemGroup>
 </Project>

@@ -264,8 +264,7 @@ namespace QuantConnect.Brokerages.Trading212.Api
         /// <returns>The placed order as the broker recorded it.</returns>
         public Task<Trading212Order> PlaceMarketOrderAsync(Trading212MarketOrderRequest request, CancellationToken cancellationToken = default)
         {
-            return RequestAsync<Trading212Order>(HttpMethod.Post, $"{ApiPathPrefix}/orders/market", request,
-                Trading212RateLimits.PlaceOrder, cancellationToken);
+            return PlaceOrderAsync($"{ApiPathPrefix}/orders/market", request, cancellationToken);
         }
 
         /// <summary>
@@ -276,8 +275,7 @@ namespace QuantConnect.Brokerages.Trading212.Api
         /// <returns>The placed order as the broker recorded it.</returns>
         public Task<Trading212Order> PlaceLimitOrderAsync(Trading212LimitOrderRequest request, CancellationToken cancellationToken = default)
         {
-            return RequestAsync<Trading212Order>(HttpMethod.Post, $"{ApiPathPrefix}/orders/limit", request,
-                Trading212RateLimits.PlaceOrder, cancellationToken);
+            return PlaceOrderAsync($"{ApiPathPrefix}/orders/limit", request, cancellationToken);
         }
 
         /// <summary>
@@ -288,8 +286,7 @@ namespace QuantConnect.Brokerages.Trading212.Api
         /// <returns>The placed order as the broker recorded it.</returns>
         public Task<Trading212Order> PlaceStopOrderAsync(Trading212StopOrderRequest request, CancellationToken cancellationToken = default)
         {
-            return RequestAsync<Trading212Order>(HttpMethod.Post, $"{ApiPathPrefix}/orders/stop", request,
-                Trading212RateLimits.PlaceOrder, cancellationToken);
+            return PlaceOrderAsync($"{ApiPathPrefix}/orders/stop", request, cancellationToken);
         }
 
         /// <summary>
@@ -300,8 +297,7 @@ namespace QuantConnect.Brokerages.Trading212.Api
         /// <returns>The placed order as the broker recorded it.</returns>
         public Task<Trading212Order> PlaceStopLimitOrderAsync(Trading212StopLimitOrderRequest request, CancellationToken cancellationToken = default)
         {
-            return RequestAsync<Trading212Order>(HttpMethod.Post, $"{ApiPathPrefix}/orders/stop_limit", request,
-                Trading212RateLimits.PlaceOrder, cancellationToken);
+            return PlaceOrderAsync($"{ApiPathPrefix}/orders/stop_limit", request, cancellationToken);
         }
 
         /// <summary>
@@ -351,6 +347,59 @@ namespace QuantConnect.Brokerages.Trading212.Api
         #region HTTP plumbing
 
         /// <summary>
+        /// Sends an order placement request and returns the order as the broker recorded it.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// A placement is only retried on <c>429 Too Many Requests</c>, where the request is known not to have
+        /// been processed. A timeout, a 408 or a 5xx from a gateway says nothing about whether the order was
+        /// created, so retrying could place the same order twice; those outcomes are reported as a
+        /// <see cref="Trading212OrderPlacementException"/> for the caller to reconcile against the broker's
+        /// order list.
+        /// </para>
+        /// </remarks>
+        /// <typeparam name="TRequest">The order request type.</typeparam>
+        /// <param name="resource">The relative resource.</param>
+        /// <param name="request">The order request.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        /// <returns>The placed order.</returns>
+        private async Task<Trading212Order> PlaceOrderAsync<TRequest>(string resource, TRequest request, CancellationToken cancellationToken)
+        {
+            HttpResponseMessage response;
+            try
+            {
+                response = await SendWithRetriesAsync(HttpMethod.Post, resource, request, Trading212RateLimits.PlaceOrder,
+                    cancellationToken, retryServerErrors: false).ConfigureAwait(false);
+            }
+            catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException && !cancellationToken.IsCancellationRequested)
+            {
+                // No response at all: the order may still have reached the broker.
+                throw new Trading212OrderPlacementException(resource, statusCode: null,
+                    $"The order request to [{resource}] failed before a response was received: {exception.Message}", exception);
+            }
+
+            using (response)
+            {
+                var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    if (IsAmbiguousOutcome(response.StatusCode))
+                    {
+                        throw new Trading212OrderPlacementException(resource, response.StatusCode,
+                            $"Trading 212 answered {(int)response.StatusCode} ({response.StatusCode}) for [{resource}], " +
+                            "so the order may or may not have been placed.",
+                            CreateException(response.StatusCode, resource, body));
+                    }
+
+                    throw CreateException(response.StatusCode, resource, body);
+                }
+
+                return DeserializeBody<Trading212Order>(body, HttpMethod.Post, resource);
+            }
+        }
+
+        /// <summary>
         /// Sends a request and deserializes the response body.
         /// </summary>
         /// <typeparam name="T">The type to deserialize the response into.</typeparam>
@@ -378,6 +427,19 @@ namespace QuantConnect.Brokerages.Trading212.Api
         {
             var body = await SendAndReadAsync(method, resource, jsonBody, rateLimitKey, cancellationToken).ConfigureAwait(false);
 
+            return DeserializeBody<T>(body, method, resource);
+        }
+
+        /// <summary>
+        /// Deserializes a response body.
+        /// </summary>
+        /// <typeparam name="T">The type to deserialize into.</typeparam>
+        /// <param name="body">The raw response body.</param>
+        /// <param name="method">The HTTP method, for the error message.</param>
+        /// <param name="resource">The relative resource, for the error message.</param>
+        /// <returns>The deserialized response.</returns>
+        private static T DeserializeBody<T>(string body, HttpMethod method, string resource)
+        {
             if (string.IsNullOrWhiteSpace(body))
             {
                 return default;
@@ -489,7 +551,7 @@ namespace QuantConnect.Brokerages.Trading212.Api
         /// <param name="rateLimitKey">The rate limit key of the endpoint.</param>
         /// <param name="cancellationToken">The cancellation token.</param>
         /// <returns>The response message, which the caller disposes.</returns>
-        private async Task<HttpResponseMessage> SendWithRetriesAsync(HttpMethod method, string resource, object jsonBody, string rateLimitKey, CancellationToken cancellationToken)
+        private async Task<HttpResponseMessage> SendWithRetriesAsync(HttpMethod method, string resource, object jsonBody, string rateLimitKey, CancellationToken cancellationToken, bool retryServerErrors = true)
         {
             for (var attempt = 0; ; attempt++)
             {
@@ -513,7 +575,7 @@ namespace QuantConnect.Brokerages.Trading212.Api
                     throw;
                 }
 
-                if (!IsRetryable(response.StatusCode) || attempt >= MaxRetries)
+                if (!IsRetryable(response.StatusCode, retryServerErrors) || attempt >= MaxRetries)
                 {
                     return response;
                 }
@@ -553,14 +615,49 @@ namespace QuantConnect.Brokerages.Trading212.Api
         /// <summary>
         /// Returns whether a status code indicates a transient condition worth retrying.
         /// </summary>
+        /// <remarks>
+        /// A <c>429</c> is always worth retrying: the request was rejected before it was processed. The other
+        /// codes are only retried for requests that are safe to repeat, because a 408 or a gateway error on a
+        /// mutating request does not say whether the broker applied it.
+        /// </remarks>
         /// <param name="statusCode">The status code.</param>
+        /// <param name="retryServerErrors">Whether server-side failures may be retried.</param>
         /// <returns><c>true</c> when the request should be retried.</returns>
-        private static bool IsRetryable(HttpStatusCode statusCode)
+        private static bool IsRetryable(HttpStatusCode statusCode, bool retryServerErrors)
+        {
+            if (statusCode == HttpStatusCode.TooManyRequests)
+            {
+                return true;
+            }
+
+            if (!retryServerErrors)
+            {
+                return false;
+            }
+
+            switch (statusCode)
+            {
+                case HttpStatusCode.RequestTimeout:
+                case HttpStatusCode.InternalServerError:
+                case HttpStatusCode.BadGateway:
+                case HttpStatusCode.ServiceUnavailable:
+                case HttpStatusCode.GatewayTimeout:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        /// <summary>
+        /// Returns whether a status code leaves it unknown whether a mutating request was applied.
+        /// </summary>
+        /// <param name="statusCode">The status code.</param>
+        /// <returns><c>true</c> when the outcome is unknown.</returns>
+        private static bool IsAmbiguousOutcome(HttpStatusCode statusCode)
         {
             switch (statusCode)
             {
                 case HttpStatusCode.RequestTimeout:
-                case HttpStatusCode.TooManyRequests:
                 case HttpStatusCode.InternalServerError:
                 case HttpStatusCode.BadGateway:
                 case HttpStatusCode.ServiceUnavailable:

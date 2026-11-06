@@ -13,9 +13,8 @@
  * limitations under the License.
 */
 
+using System;
 using NUnit.Framework;
-using QuantConnect.Interfaces;
-using QuantConnect.Util;
 using QuantConnect.Brokerages.Trading212.Models;
 
 namespace QuantConnect.Brokerages.Trading212.Tests
@@ -23,26 +22,28 @@ namespace QuantConnect.Brokerages.Trading212.Tests
     [TestFixture]
     public class Trading212BrokerageAdditionalTests
     {
-        [Test]
-        public void ParameterlessConstructorComposerUsage()
-        {
-            var brokerage = Composer.Instance.GetExportedValueByTypeName<IDataQueueHandler>("Trading212Brokerage");
-
-            Assert.That(brokerage, Is.Not.Null);
-            Assert.That(brokerage, Is.InstanceOf<Trading212Brokerage>());
-        }
-
         [TestCase("live", Trading212Environment.Live)]
         [TestCase("LIVE", Trading212Environment.Live)]
+        [TestCase(" live ", Trading212Environment.Live)]
         [TestCase("demo", Trading212Environment.Demo)]
         [TestCase("Demo", Trading212Environment.Demo)]
         [TestCase("paper", Trading212Environment.Demo)]
-        [TestCase("", Trading212Environment.Live)]
-        [TestCase(null, Trading212Environment.Live)]
-        [TestCase("something-else", Trading212Environment.Live)]
         public void ParsesTheConfiguredEnvironment(string value, Trading212Environment expected)
         {
             Assert.That(Trading212Brokerage.ParseEnvironment(value), Is.EqualTo(expected));
+        }
+
+        /// <summary>
+        /// A missing or misspelled environment must not silently select the account that trades real money.
+        /// </summary>
+        [TestCase("")]
+        [TestCase("   ")]
+        [TestCase(null)]
+        [TestCase("something-else")]
+        [TestCase("dmeo")]
+        public void RejectsAnUnknownEnvironment(string value)
+        {
+            Assert.Throws<ArgumentException>(() => Trading212Brokerage.ParseEnvironment(value));
         }
     }
 }

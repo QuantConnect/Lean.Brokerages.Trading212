@@ -1,6 +1,6 @@
 # Lean.Brokerages.Trading212
 
-[![Build Status](https://github.com/nimakalantar/Lean.Brokerages.Trading212/workflows/Build%20%26%20Test/badge.svg)](https://github.com/nimakalantar/Lean.Brokerages.Trading212/actions?query=workflow%3A%22Build+%26+Test%22)
+[![Build Status](https://github.com/QuantConnect/Lean.Brokerages.Trading212/workflows/Build%20%26%20Test/badge.svg)](https://github.com/QuantConnect/Lean.Brokerages.Trading212/actions?query=workflow%3A%22Build+%26+Test%22)
 
 Trading 212 brokerage plugin for [LEAN](https://github.com/QuantConnect/Lean).
 
@@ -24,13 +24,11 @@ through the [Trading 212 Public API](https://docs.trading212.com/api).
 ## Dependency on the LEAN brokerage model
 
 This plugin expects the `Trading212BrokerageModel` added to LEAN by
-[QuantConnect/Lean#9982](https://github.com/QuantConnect/Lean/pull/9982) (and its follow-ups
-[#9983](https://github.com/QuantConnect/Lean/pull/9983) and
-[#9985](https://github.com/QuantConnect/Lean/pull/9985), tracked by
-[#9981](https://github.com/QuantConnect/Lean/issues/9981)).
-
-`Trading212BrokerageFactory.GetBrokerageModel` returns that model, so the plugin compiles against a LEAN
-that contains it. The plugin also needs a `live-trading212` block in `Launcher/config.json`; see
+[QuantConnect/Lean#9982](https://github.com/QuantConnect/Lean/pull/9982) (tracked by
+[#9981](https://github.com/QuantConnect/Lean/issues/9981)). `Trading212BrokerageFactory.GetBrokerageModel`
+returns that model, so the plugin builds against a LEAN that contains it, the same way the other brokerage
+repositories build against the `QuantConnect.Brokerages` package. The plugin also needs a
+`live-trading212` block in `Launcher/config.json`; see
 [LEAN launcher configuration](#lean-launcher-configuration).
 
 ## Supported accounts and instruments
@@ -72,7 +70,7 @@ Add the following settings to `config.json` (or the LEAN CLI `config.json`, or t
 | --- | --- | --- |
 | `trading212-api-key` | Yes | The API key, used as the Basic authentication user name. |
 | `trading212-api-secret` | Yes | The API secret, used as the Basic authentication password. |
-| `trading212-environment` | No | `live` (default) or `demo`. Selects `https://live.trading212.com` or `https://demo.trading212.com`. |
+| `trading212-environment` | Yes | `live` or `demo`. Selects `https://live.trading212.com` or `https://demo.trading212.com`. There is no default: an unset or unrecognized value is rejected rather than treated as live. |
 | `trading212-order-update-interval-seconds` | No | How often the order update poller runs. Default `10`. The pending orders endpoint allows 1 request per 5 s, so polling faster only produces `429`s. |
 | `trading212-order-history-pages` | No | How many historical order pages the poller reads while resolving finished orders. Default `2`. |
 
@@ -127,7 +125,21 @@ by polling:
 
 Because the historical orders endpoint exposes only a cursor and a ticker filter (no time filter), the
 poller reads the most recent `trading212-order-history-pages` pages on each pass. An order that fills but is
-not covered by those pages is picked up on a later pass.
+not covered by those pages is picked up on a later pass; before giving up after
+`trading212-order-history-pages` bounded retries, the poller looks the order up with the endpoint's `ticker`
+filter, and raises a `BrokerageMessageType.Error` if it is still nowhere to be found.
+
+A pending order carries a cumulative `filledQuantity` and `filledValue` but no execution price, so the price
+of each incremental fill is the change in value over the change in quantity. Reporting a partial fill at
+price zero would book the shares for free and corrupt the average price, cash and P&L.
+
+## Order placement
+
+A placement is retried only on `429 Too Many Requests`, where the request is known not to have been
+processed. A timeout, a `408` or a `5xx` from a gateway does not say whether the order was created, so the
+plugin does not retry it: it asks the broker for the account's working and recent orders, and adopts the
+order when it finds it. If it does not, the order is reported as invalid and a
+`BrokerageMessageType.Error` tells the algorithm to check the account before placing it again.
 
 ## Rejections are never swallowed
 
@@ -155,13 +167,16 @@ diagnostics. `Trading212ApiException.RawBody` always holds the body exactly as s
 ## Order fees
 
 Trading 212 charges no commission, but a trade is not free: there is a 0.15% FX fee on the converted notional
-and, on US sales, the SEC and FINRA fees. `Trading212FeeModel` models those, and this plugin reuses it on a
-fill, so a live order is priced the same way a backtest is. The fee is reported once, on the fill that
-completes the order, because the model prices the whole order quantity.
+and, on US sales, the SEC and FINRA fees. The fill reported by the history endpoint carries what was actually
+charged in `walletImpact.taxes`, and that is what the plugin reports on the `OrderEvent`, converted into the
+account currency with the fill's `fxRate`. The fee is reported once, on the fill that completes the order,
+which is the only status for which the history endpoint reports a fill.
 
-Verified on the paper account: a 1-share AMZN buy filling at 253.58 in a GBP account reported a fee of
-0.38037 USD, which is 0.15% of the notional. The fee is applied to the portfolio in the account currency
-(`AccountCurrencyOrderFee`), so it never leaves a balance in the instrument's currency.
+The plugin therefore reports the broker's real cost rather than a model of it, and does not price a fill from
+a security's market price, so it never writes into a `Security` the algorithm owns.
+
+Verified on the paper account: a 1-share AMZN buy filling at 253.58 in a GBP account was charged 0.38037 USD,
+which is 0.15% of the notional.
 
 ## Rate limits
 
@@ -213,8 +228,8 @@ TRADING212_LIVE_API_KEY_ID=
 TRADING212_LIVE_SECRET_KEY=
 ```
 
-`.env` is gitignored. Select the environment with `TRADING212_ENVIRONMENT` (`demo`, the default, or
-`live`):
+`.env` is gitignored. The online tests select the environment with `TRADING212_ENVIRONMENT` and default to
+`demo` when it is unset, so an unset variable never reaches a real account:
 
 ```bash
 TRADING212_ENVIRONMENT=demo dotnet test QuantConnect.Trading212Brokerage.Tests/bin/Release/QuantConnect.Brokerages.Trading212.Tests.dll \
@@ -241,8 +256,8 @@ dotnet run --project QuantConnect.Trading212Brokerage.ToolBox -- \
 
 ## Known limitations
 
-- **No market data or history.** `CanSubscribe` is always `false` and `GetHistory` always returns `null`.
-  The launcher must be configured with `LiveDataQueue` and `SubscriptionDataReaderHistoryProvider`.
+- **No market data or history.** The brokerage implements no data queue handler, and `GetHistory` returns
+  `null`. The launcher must be configured with `LiveDataQueue` and `SubscriptionDataReaderHistoryProvider`.
 - **No order amending.** `UpdateOrder` returns `false` and raises a `UpdateOrderNotSupported` message,
   because the Public API has no replace endpoint. Cancel the order and place a new one.
 - **US-listed equities and ETFs only.** Other exchanges, and warrants, are reported and skipped.

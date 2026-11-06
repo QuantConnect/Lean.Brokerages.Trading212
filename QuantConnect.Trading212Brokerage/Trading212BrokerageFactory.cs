@@ -41,8 +41,8 @@ namespace QuantConnect.Brokerages.Trading212
         {
             { "trading212-api-key", Config.Get("trading212-api-key") },
             { "trading212-api-secret", Config.Get("trading212-api-secret") },
-            // "live" (real money, the default) or "demo" (paper trading).
-            { "trading212-environment", Config.Get("trading212-environment", "live") }
+            // Required: "live" (real money) or "demo" (paper trading). There is no default.
+            { "trading212-environment", Config.Get("trading212-environment") }
         };
 
         /// <summary>
@@ -80,7 +80,6 @@ namespace QuantConnect.Brokerages.Trading212
             }
 
             var brokerage = new Trading212Brokerage(apiKey, apiSecret, Trading212Brokerage.ParseEnvironment(environment), algorithm);
-            Composer.Instance.AddPart<IDataQueueHandler>(brokerage);
 
             return brokerage;
         }

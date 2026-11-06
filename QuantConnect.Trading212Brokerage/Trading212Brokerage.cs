@@ -30,12 +30,10 @@ using Newtonsoft.Json.Linq;
 using QuantConnect.Api;
 using QuantConnect.Configuration;
 using QuantConnect.Data;
-using QuantConnect.Data.Market;
 using QuantConnect.Interfaces;
 using QuantConnect.Logging;
 using QuantConnect.Orders;
 using QuantConnect.Orders.Fees;
-using QuantConnect.Packets;
 using QuantConnect.Securities;
 using QuantConnect.Util;
 using QuantConnect.Brokerages.Trading212.Api;
@@ -51,9 +49,8 @@ namespace QuantConnect.Brokerages.Trading212
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Trading 212's Public API is order and account only: it serves no market data and no history.
-    /// <see cref="GetHistory"/> therefore returns <c>null</c>, <c>CanSubscribe</c> is always <c>false</c>,
-    /// and the LEAN launcher must be configured with
+    /// Trading 212's Public API is order and account only: it serves no market data and no history, so the
+    /// brokerage implements no data feed and the LEAN launcher must be configured with
     /// <c>QuantConnect.Lean.Engine.DataFeeds.Queues.LiveDataQueue</c> and
     /// <c>SubscriptionDataReaderHistoryProvider</c>.
     /// </para>
@@ -68,8 +65,14 @@ namespace QuantConnect.Brokerages.Trading212
     /// </para>
     /// </remarks>
     [BrokerageFactory(typeof(Trading212BrokerageFactory))]
-    public class Trading212Brokerage : Brokerage, IDataQueueHandler, IDataQueueUniverseProvider
+    public class Trading212Brokerage : Brokerage
     {
+        /// <summary>
+        /// How far before a placement request a broker order may have been created and still be treated as the
+        /// lost order, in minutes.
+        /// </summary>
+        private const int PlacementReconciliationWindowMinutes = 5;
+
         /// <summary>
         /// The default number of historical order pages read on each poll while resolving finished orders.
         /// </summary>
@@ -84,17 +87,6 @@ namespace QuantConnect.Brokerages.Trading212
         /// The symbol mapper, built from the instruments metadata endpoint.
         /// </summary>
         private Trading212SymbolMapper _symbolMapper;
-
-        /// <summary>
-        /// Consolidates subscribed ticks. Trading 212 serves no data, so it is only kept for the
-        /// <see cref="IDataQueueHandler"/> contract.
-        /// </summary>
-        private IDataAggregator _aggregator;
-
-        /// <summary>
-        /// The subscription manager backing <see cref="IDataQueueHandler"/>.
-        /// </summary>
-        private EventBasedDataQueueHandlerSubscriptionManager _subscriptionManager;
 
         /// <summary>
         /// Cancels the order update poller.
@@ -115,6 +107,19 @@ namespace QuantConnect.Brokerages.Trading212
         /// The last LEAN status emitted for a LEAN order id, so repeated polls do not re-emit it.
         /// </summary>
         private readonly ConcurrentDictionary<int, OrderStatus> _lastOrderStatusByLeanOrderId = new();
+
+        /// <summary>
+        /// The cumulative filled value already reported for a LEAN order id, in the instrument's currency. The
+        /// pending orders endpoint reports a cumulative quantity and value but no execution price, so the price
+        /// of an incremental fill is the change in value over the change in quantity.
+        /// </summary>
+        private readonly ConcurrentDictionary<int, decimal> _reportedFillValueByLeanOrderId = new();
+
+        /// <summary>
+        /// The broker ticker of each tracked order, so an order that has left the pending orders and the
+        /// recent history pages can be looked up with the endpoint's ticker filter.
+        /// </summary>
+        private readonly ConcurrentDictionary<string, string> _trackedOrderTickers = new();
 
         /// <summary>
         /// How many times the historical orders endpoint has been read looking for a tracked order.
@@ -163,11 +168,6 @@ namespace QuantConnect.Brokerages.Trading212
         private bool _historyNotSupportedWarningSent;
 
         /// <summary>
-        /// Ensures the "no market data" warning is only logged once.
-        /// </summary>
-        private bool _marketDataNotSupportedWarningSent;
-
-        /// <summary>
         /// Guards against running the initialization twice.
         /// </summary>
         private bool _isInitialized;
@@ -176,11 +176,6 @@ namespace QuantConnect.Brokerages.Trading212
         /// The order provider, used to resolve the LEAN orders a broker order belongs to.
         /// </summary>
         protected IOrderProvider OrderProvider { get; private set; }
-
-        /// <summary>
-        /// The security provider.
-        /// </summary>
-        protected ISecurityProvider SecurityProvider { get; private set; }
 
         /// <summary>
         /// The symbol mapper, exposed for tests.
@@ -201,45 +196,28 @@ namespace QuantConnect.Brokerages.Trading212
         public override bool IsConnected => _isConnected;
 
         /// <summary>
-        /// Parameterless constructor, required for brokerages implementing <see cref="IDataQueueHandler"/>.
-        /// </summary>
-        /// <remarks>
-        /// Reads the credentials from the LEAN configuration. Trading 212 serves no market data, so a
-        /// brokerage created this way is only usable for its brokerage, not as a data source.
-        /// </remarks>
-        public Trading212Brokerage()
-            : this(Config.Get("trading212-api-key"), Config.Get("trading212-api-secret"),
-                ParseEnvironment(Config.Get("trading212-environment")),
-                orderProvider: null, securityProvider: null,
-                aggregator: Composer.Instance.GetPart<IDataAggregator>())
-        {
-        }
-
-        /// <summary>
         /// Creates a new instance.
         /// </summary>
         /// <param name="apiKey">The Trading 212 API key.</param>
         /// <param name="apiSecret">The Trading 212 API secret.</param>
         /// <param name="environment">The environment to connect to.</param>
         /// <param name="orderProvider">The order provider.</param>
-        /// <param name="securityProvider">The security provider.</param>
-        /// <param name="aggregator">The data aggregator, only needed for the <see cref="IDataQueueHandler"/> contract.</param>
         public Trading212Brokerage(string apiKey, string apiSecret, Trading212Environment environment,
-            IOrderProvider orderProvider, ISecurityProvider securityProvider, IDataAggregator aggregator = null)
+            IOrderProvider orderProvider)
             : base("Trading212")
         {
-            Initialize(apiKey, apiSecret, environment, orderProvider, securityProvider, aggregator);
+            Initialize(apiKey, apiSecret, environment, orderProvider);
         }
 
         /// <summary>
-        /// Creates a new instance, taking the order and security providers from the algorithm.
+        /// Creates a new instance, taking the order provider from the algorithm.
         /// </summary>
         /// <param name="apiKey">The Trading 212 API key.</param>
         /// <param name="apiSecret">The Trading 212 API secret.</param>
         /// <param name="environment">The environment to connect to.</param>
         /// <param name="algorithm">The algorithm instance.</param>
         public Trading212Brokerage(string apiKey, string apiSecret, Trading212Environment environment, IAlgorithm algorithm)
-            : this(apiKey, apiSecret, environment, algorithm?.Portfolio?.Transactions, algorithm?.Portfolio, Composer.Instance.GetPart<IDataAggregator>())
+            : this(apiKey, apiSecret, environment, algorithm?.Portfolio?.Transactions)
         {
         }
 
@@ -252,23 +230,15 @@ namespace QuantConnect.Brokerages.Trading212
         /// </remarks>
         /// <param name="apiClient">The API client to use.</param>
         /// <param name="orderProvider">The order provider used to resolve LEAN orders by broker id.</param>
-        /// <param name="securityProvider">The security provider used to price order fees.</param>
-        internal Trading212Brokerage(Trading212ApiClient apiClient, IOrderProvider orderProvider = null, ISecurityProvider securityProvider = null)
+        internal Trading212Brokerage(Trading212ApiClient apiClient, IOrderProvider orderProvider = null)
             : base("Trading212")
         {
             _isInitialized = true;
             _apiClient = apiClient;
             _symbolMapper = new Trading212SymbolMapper();
             OrderProvider = orderProvider;
-            SecurityProvider = securityProvider;
             _orderUpdateInterval = TimeSpan.FromSeconds(5);
             _orderHistoryPages = 1;
-            _aggregator = Composer.Instance.GetPart<IDataAggregator>();
-            _subscriptionManager = new EventBasedDataQueueHandlerSubscriptionManager
-            {
-                SubscribeImpl = (symbols, _) => Subscribe(symbols),
-                UnsubscribeImpl = (symbols, _) => Unsubscribe(symbols)
-            };
         }
 
         /// <summary>
@@ -278,10 +248,7 @@ namespace QuantConnect.Brokerages.Trading212
         /// <param name="apiSecret">The Trading 212 API secret.</param>
         /// <param name="environment">The environment to connect to.</param>
         /// <param name="orderProvider">The order provider.</param>
-        /// <param name="securityProvider">The security provider.</param>
-        /// <param name="aggregator">The data aggregator.</param>
-        protected void Initialize(string apiKey, string apiSecret, Trading212Environment environment,
-            IOrderProvider orderProvider, ISecurityProvider securityProvider, IDataAggregator aggregator)
+        protected void Initialize(string apiKey, string apiSecret, Trading212Environment environment, IOrderProvider orderProvider)
         {
             if (_isInitialized)
             {
@@ -290,18 +257,10 @@ namespace QuantConnect.Brokerages.Trading212
 
             _isInitialized = true;
             OrderProvider = orderProvider;
-            SecurityProvider = securityProvider;
             _symbolMapper = new Trading212SymbolMapper();
 
             _orderUpdateInterval = TimeSpan.FromSeconds(Config.GetInt("trading212-order-update-interval-seconds", 10));
             _orderHistoryPages = Math.Max(1, Config.GetInt("trading212-order-history-pages", DefaultOrderHistoryPages));
-
-            _aggregator = aggregator ?? Composer.Instance.GetPart<IDataAggregator>();
-            _subscriptionManager = new EventBasedDataQueueHandlerSubscriptionManager
-            {
-                SubscribeImpl = (symbols, _) => Subscribe(symbols),
-                UnsubscribeImpl = (symbols, _) => Unsubscribe(symbols)
-            };
 
             _apiClient = CreateApiClient(apiKey, apiSecret, environment);
 
@@ -326,23 +285,31 @@ namespace QuantConnect.Brokerages.Trading212
         }
 
         /// <summary>
-        /// Parses the configured environment name, defaulting to live.
+        /// Parses the configured environment name.
         /// </summary>
+        /// <remarks>
+        /// There is no default: an unset or unrecognized value throws rather than falling back to the
+        /// environment that trades real money.
+        /// </remarks>
         /// <param name="value">The configured value, either <c>live</c> or <c>demo</c>.</param>
         /// <returns>The parsed environment.</returns>
+        /// <exception cref="ArgumentException">The value is missing or not a known environment.</exception>
         public static Trading212Environment ParseEnvironment(string value)
         {
             if (string.IsNullOrWhiteSpace(value))
             {
-                return Trading212Environment.Live;
+                throw new ArgumentException(
+                    "The Trading 212 environment is not configured. Set 'trading212-environment' to 'live' or 'demo'.",
+                    nameof(value));
             }
 
-            if (Enum.TryParse<Trading212Environment>(value, ignoreCase: true, out var environment))
+            if (Enum.TryParse<Trading212Environment>(value.Trim(), ignoreCase: true, out var environment)
+                && Enum.IsDefined(environment))
             {
                 return environment;
             }
 
-            // Accept the words the Trading 212 documentation uses for the two environments.
+            // Accept the words the Trading 212 documentation uses for the demo environment.
             switch (value.Trim().ToLowerInvariant())
             {
                 case "paper":
@@ -350,7 +317,9 @@ namespace QuantConnect.Brokerages.Trading212
                 case "paper trading":
                     return Trading212Environment.Demo;
                 default:
-                    return Trading212Environment.Live;
+                    throw new ArgumentException(
+                        $"'{value}' is not a Trading 212 environment. Set 'trading212-environment' to 'live' or 'demo'.",
+                        nameof(value));
             }
         }
 
@@ -393,7 +362,12 @@ namespace QuantConnect.Brokerages.Trading212
             // Seed the orders that are already working so their final state is reported.
             foreach (var pending in _apiClient.GetPendingOrdersAsync().SynchronouslyAwaitTaskResult())
             {
-                _trackedOrderIds[GetBrokerageOrderId(pending.Id)] = 0;
+                var brokerageId = GetBrokerageOrderId(pending.Id);
+                _trackedOrderIds[brokerageId] = 0;
+                if (!string.IsNullOrEmpty(pending.Ticker))
+                {
+                    _trackedOrderTickers[brokerageId] = pending.Ticker;
+                }
             }
 
             _isConnected = true;
@@ -626,22 +600,33 @@ namespace QuantConnect.Brokerages.Trading212
                 return true;
             }
 
+            var placedAtUtc = DateTime.UtcNow;
+
             try
             {
                 var placed = PlaceBrokerageOrder(order, ticker, timeValidity);
-                if (placed == null || placed.Id == 0)
+                OnOrderPlaced(order, ticker, placed);
+            }
+            catch (Trading212OrderPlacementException exception)
+            {
+                // The broker may have accepted the order and lost the response, so ask what it holds before
+                // telling the algorithm the order failed.
+                Log.Error($"{nameof(Trading212Brokerage)}.{nameof(PlaceOrder)}: The outcome of order {order.Id} is unknown: {exception.Message}");
+
+                var placed = TryReconcilePlacement(order, ticker, placedAtUtc);
+                if (placed != null)
                 {
-                    throw new InvalidOperationException("Trading 212 accepted the request but returned no order id.");
+                    Log.Trace($"{nameof(Trading212Brokerage)}.{nameof(PlaceOrder)}: Order {order.Id} was found at Trading 212 as order {placed.Id} after an ambiguous response.");
+                    OnOrderPlaced(order, ticker, placed);
+                    return true;
                 }
 
-                var brokerageId = GetBrokerageOrderId(placed.Id);
-                order.BrokerId.Add(brokerageId);
-                _trackedOrderIds[brokerageId] = 0;
-                _lastOrderStatusByLeanOrderId[order.Id] = OrderStatus.Submitted;
-
-                OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero, "Trading 212 order submitted.")
+                var message = $"The order may or may not have been placed at Trading 212 ({exception.Message}). It was not found in the broker's orders, so check the account before placing it again.";
+                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "OrderPlacementUnknown", message));
+                OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero, message)
                 {
-                    Status = OrderStatus.Submitted
+                    Status = OrderStatus.Invalid,
+                    Message = message
                 });
             }
             catch (Trading212ApiException exception)
@@ -665,6 +650,87 @@ namespace QuantConnect.Brokerages.Trading212
             }
 
             return true;
+        }
+
+        /// <summary>
+        /// Registers a broker order with LEAN and reports it as submitted.
+        /// </summary>
+        /// <param name="order">The LEAN order.</param>
+        /// <param name="ticker">The broker ticker.</param>
+        /// <param name="placed">The order as the broker recorded it.</param>
+        private void OnOrderPlaced(Order order, string ticker, Trading212Order placed)
+        {
+            if (placed == null || placed.Id == 0)
+            {
+                throw new InvalidOperationException("Trading 212 accepted the request but returned no order id.");
+            }
+
+            var brokerageId = GetBrokerageOrderId(placed.Id);
+            order.BrokerId.Add(brokerageId);
+            _trackedOrderIds[brokerageId] = 0;
+            _trackedOrderTickers[brokerageId] = string.IsNullOrEmpty(placed.Ticker) ? ticker : placed.Ticker;
+            _lastOrderStatusByLeanOrderId[order.Id] = OrderStatus.Submitted;
+
+            OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero, "Trading 212 order submitted.")
+            {
+                Status = OrderStatus.Submitted
+            });
+        }
+
+        /// <summary>
+        /// Looks for an order the broker accepted but whose response was lost, so it is not placed twice and is
+        /// not reported as failed when it is live.
+        /// </summary>
+        /// <param name="order">The LEAN order whose placement outcome is unknown.</param>
+        /// <param name="ticker">The broker ticker.</param>
+        /// <param name="placedAtUtc">When the placement request was sent.</param>
+        /// <returns>The matching broker order, or <c>null</c> when it was not found.</returns>
+        private Trading212Order TryReconcilePlacement(Order order, string ticker, DateTime placedAtUtc)
+        {
+            // Only orders this brokerage has not already accounted for can be the lost one.
+            var since = placedAtUtc.AddMinutes(-PlacementReconciliationWindowMinutes);
+
+            try
+            {
+                var pending = _apiClient.GetPendingOrdersAsync().SynchronouslyAwaitTaskResult();
+                var match = FindMatchingOrder(pending, order, ticker, since);
+                if (match != null)
+                {
+                    return match;
+                }
+
+                // A market order can fill before the next poll, so the working orders alone are not enough.
+                var history = _apiClient.GetHistoricalOrdersAsync(_orderHistoryPages, ticker).SynchronouslyAwaitTaskResult();
+                var historicalMatch = FindMatchingOrder(history.Where(entry => entry?.Order != null).Select(entry => entry.Order), order, ticker, since);
+                return historicalMatch;
+            }
+            catch (Exception exception)
+            {
+                Log.Error($"{nameof(Trading212Brokerage)}.{nameof(TryReconcilePlacement)}: Could not read the broker orders to resolve order {order.Id}: {exception.Message}");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Finds the broker order that matches a LEAN order placement request.
+        /// </summary>
+        /// <param name="brokerageOrders">The broker orders to search.</param>
+        /// <param name="order">The LEAN order.</param>
+        /// <param name="ticker">The broker ticker.</param>
+        /// <param name="sinceUtc">The earliest creation time a candidate may have.</param>
+        /// <returns>The matching order, or <c>null</c>.</returns>
+        private Trading212Order FindMatchingOrder(IEnumerable<Trading212Order> brokerageOrders, Order order, string ticker, DateTime sinceUtc)
+        {
+            var side = order.Quantity < 0 ? Trading212OrderSide.Sell : Trading212OrderSide.Buy;
+            var quantity = Math.Abs(order.Quantity);
+
+            return brokerageOrders.FirstOrDefault(candidate =>
+                candidate != null
+                && !_trackedOrderIds.ContainsKey(GetBrokerageOrderId(candidate.Id))
+                && string.Equals(candidate.Ticker, ticker, StringComparison.OrdinalIgnoreCase)
+                && candidate.Side == side
+                && Math.Abs(candidate.Quantity) == quantity
+                && (candidate.CreatedAtUtc == null || candidate.CreatedAtUtc.Value >= sinceUtc));
         }
 
         /// <summary>
@@ -834,7 +900,13 @@ namespace QuantConnect.Brokerages.Trading212
             var pendingById = new HashSet<string>(StringComparer.Ordinal);
             foreach (var pending in pendingOrders)
             {
-                pendingById.Add(GetBrokerageOrderId(pending.Id));
+                var brokerageId = GetBrokerageOrderId(pending.Id);
+                pendingById.Add(brokerageId);
+                if (!string.IsNullOrEmpty(pending.Ticker))
+                {
+                    _trackedOrderTickers[brokerageId] = pending.Ticker;
+                }
+
                 ApplyBrokerageOrder(pending, fill: null);
             }
 
@@ -869,12 +941,32 @@ namespace QuantConnect.Brokerages.Trading212
                 // The order is not in the pages that were read yet. The endpoint has no time filter, so keep
                 // asking for a bounded number of polls and then stop rather than polling for ever.
                 var attempts = _historyLookupAttempts.AddOrUpdate(brokerageId, 1, (_, count) => count + 1);
-                if (attempts == MaxHistoryLookupAttempts)
+                if (attempts < MaxHistoryLookupAttempts)
                 {
-                    Log.Error($"{nameof(Trading212Brokerage)}.{nameof(PollOrders)}: Gave up looking for Trading 212 order {brokerageId} in the historical orders after {attempts} polls. Its final state was not reported.");
-                    _trackedOrderIds.TryRemove(brokerageId, out _);
-                    _historyLookupAttempts.TryRemove(brokerageId, out _);
+                    continue;
                 }
+
+                // Last chance: the order may have fallen out of the recent pages, so ask for its ticker only.
+                if (_trackedOrderTickers.TryGetValue(brokerageId, out var ticker) && !string.IsNullOrEmpty(ticker))
+                {
+                    var filtered = _apiClient.GetHistoricalOrdersAsync(1, ticker, cancellationToken).SynchronouslyAwaitTaskResult();
+                    var match = filtered.FirstOrDefault(candidate => candidate?.Order != null
+                        && GetBrokerageOrderId(candidate.Order.Id) == brokerageId);
+                    if (match != null)
+                    {
+                        ApplyBrokerageOrder(match.Order, match.Fill);
+                        continue;
+                    }
+                }
+
+                // The order vanished: it may have filled. Report it rather than leaving LEAN unaware.
+                var message = $"The final state of Trading 212 order {brokerageId} was not reported after {attempts} polls, " +
+                    "and the order is no longer in the broker's pending or recent historical orders. The account may hold a position LEAN does not know about; check the account.";
+                Log.Error($"{nameof(Trading212Brokerage)}.{nameof(PollOrders)}: {message}");
+                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "OrderStateUnknown", message));
+                _trackedOrderIds.TryRemove(brokerageId, out _);
+                _historyLookupAttempts.TryRemove(brokerageId, out _);
+                _trackedOrderTickers.TryRemove(brokerageId, out _);
             }
         }
 
@@ -911,17 +1003,22 @@ namespace QuantConnect.Brokerages.Trading212
                 cumulativeFilled = Math.Abs(fill.Quantity);
             }
 
+            var cumulativeFilledValue = Math.Abs(brokerageOrder.FilledValue ?? 0m);
+            if (cumulativeFilledValue == 0m && fill != null && fill.Price > 0m)
+            {
+                cumulativeFilledValue = fill.Price * Math.Abs(fill.Quantity);
+            }
+
             var direction = Math.Sign(brokerageOrder.Quantity);
             if (direction == 0)
             {
                 direction = brokerageOrder.Side == Trading212OrderSide.Sell ? -1 : 1;
             }
 
-            var fillPrice = fill?.Price ?? 0m;
-
             foreach (var leanOrder in leanOrders)
             {
                 var previouslyReported = _reportedFillQuantityByLeanOrderId.GetOrAdd(leanOrder.Id, 0m);
+                var previouslyReportedValue = _reportedFillValueByLeanOrderId.GetOrAdd(leanOrder.Id, 0m);
                 var delta = cumulativeFilled - previouslyReported;
                 if (delta < 0m)
                 {
@@ -935,16 +1032,21 @@ namespace QuantConnect.Brokerages.Trading212
                     continue;
                 }
 
+                var fillPrice = delta > 0m
+                    ? ResolveFillPrice(brokerageOrder, fill, cumulativeFilledValue - previouslyReportedValue, delta)
+                    : fill?.Price ?? 0m;
+
                 if (delta > 0m)
                 {
                     _reportedFillQuantityByLeanOrderId[leanOrder.Id] = cumulativeFilled;
+                    _reportedFillValueByLeanOrderId[leanOrder.Id] = cumulativeFilledValue;
                 }
 
                 var message = leanStatus.Value == OrderStatus.Invalid
                     ? "Trading 212 rejected the order."
                     : $"Trading 212 order {brokerageId} is {brokerageOrder.Status}.";
 
-                var orderEvent = new OrderEvent(leanOrder, DateTime.UtcNow, GetOrderFee(leanOrder, leanStatus.Value, fillPrice), message)
+                var orderEvent = new OrderEvent(leanOrder, DateTime.UtcNow, GetOrderFee(leanStatus.Value, fill), message)
                 {
                     Status = leanStatus.Value,
                     FillPrice = fillPrice,
@@ -960,75 +1062,117 @@ namespace QuantConnect.Brokerages.Trading212
             {
                 _trackedOrderIds.TryRemove(brokerageId, out _);
                 _historyLookupAttempts.TryRemove(brokerageId, out _);
+                _trackedOrderTickers.TryRemove(brokerageId, out _);
                 foreach (var leanOrder in leanOrders)
                 {
                     _reportedFillQuantityByLeanOrderId.TryRemove(leanOrder.Id, out _);
+                    _reportedFillValueByLeanOrderId.TryRemove(leanOrder.Id, out _);
                 }
             }
         }
 
         /// <summary>
-        /// Computes the fee of an order the way the brokerage's own fee model does.
+        /// Resolves the price of an incremental fill.
+        /// </summary>
+        /// <remarks>
+        /// A pending order carries no execution price, only a cumulative quantity and value, so the price of the
+        /// shares filled between two polls is the change in value divided by the change in quantity. Reporting
+        /// zero instead would book the shares at no cost and corrupt the average price, cash and P&amp;L.
+        /// </remarks>
+        /// <param name="brokerageOrder">The broker order.</param>
+        /// <param name="fill">The fill, when the order is finished and the history endpoint reported one.</param>
+        /// <param name="filledValueDelta">The change in the cumulative filled value.</param>
+        /// <param name="quantityDelta">The change in the cumulative filled quantity.</param>
+        /// <returns>The price of the incremental fill.</returns>
+        private decimal ResolveFillPrice(Trading212Order brokerageOrder, Trading212Fill fill, decimal filledValueDelta, decimal quantityDelta)
+        {
+            if (fill?.Price > 0m)
+            {
+                return fill.Price;
+            }
+
+            if (filledValueDelta > 0m && quantityDelta > 0m)
+            {
+                return filledValueDelta / quantityDelta;
+            }
+
+            // Fall back to the order's own price rather than reporting a fill at zero.
+            if (brokerageOrder.LimitPrice is > 0m)
+            {
+                return brokerageOrder.LimitPrice.Value;
+            }
+
+            if (brokerageOrder.StopPrice is > 0m)
+            {
+                return brokerageOrder.StopPrice.Value;
+            }
+
+            var message = $"The fill price of Trading 212 order {GetBrokerageOrderId(brokerageOrder.Id)} could not be determined; it is reported as zero.";
+            Log.Error($"{nameof(Trading212Brokerage)}.{nameof(ResolveFillPrice)}: {message}");
+            OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "FillPriceUnknown", message));
+            return 0m;
+        }
+
+        /// <summary>
+        /// Returns the fee the broker charged on a fill.
         /// </summary>
         /// <remarks>
         /// <para>
-        /// Trading 212 is commission free; the costs are the FX fee on the converted notional and the US
-        /// regulatory fees, which <see cref="Trading212FeeModel"/> models for backtesting. Reusing that model
-        /// here keeps a live order's reported cost consistent with a backtest of the same order.
+        /// Trading 212 is commission free, but a trade is not free: the fill carries the costs that were
+        /// actually charged in <c>fill.walletImpact.taxes</c>, for example the FX fee on the converted notional
+        /// and the US regulatory fees. Those are reported as they are, instead of being modelled, so a live
+        /// fill carries the real cost.
         /// </para>
         /// <para>
-        /// The model is constructed with the account currency this brokerage discovered from the account
-        /// summary, which the model cannot discover on its own.
+        /// The taxes are reported in wallet currency; <c>fill.walletImpact.fxRate</c> converts the instrument's
+        /// currency into the account currency.
         /// </para>
         /// <para>
-        /// The fee is attached once, on the fill that completes the order, because the model prices the whole
-        /// order quantity rather than a single execution. A partially filled order that is then cancelled
-        /// therefore reports no fee.
+        /// The fee is attached once, on the fill that completes the order, which is the only status for which
+        /// the history endpoint reports a fill.
         /// </para>
         /// </remarks>
-        /// <param name="leanOrder">The LEAN order that changed state.</param>
         /// <param name="status">The LEAN status being reported.</param>
-        /// <param name="fillPrice">The price the order filled at, or 0 when it has not filled.</param>
-        /// <returns>The order fee, or <see cref="OrderFee.Zero"/> when it cannot be computed.</returns>
-        internal OrderFee GetOrderFee(Order leanOrder, OrderStatus status, decimal fillPrice)
+        /// <param name="fill">The fill reported by the broker, when there is one.</param>
+        /// <returns>The order fee, or <see cref="OrderFee.Zero"/> when the broker charged nothing or the fill is not final.</returns>
+        internal OrderFee GetOrderFee(OrderStatus status, Trading212Fill fill)
         {
-            if (status != OrderStatus.Filled || string.IsNullOrEmpty(_accountCurrency))
+            var walletImpact = fill?.WalletImpact;
+            if (status != OrderStatus.Filled || walletImpact?.Taxes == null || walletImpact.Taxes.Count == 0)
             {
                 return OrderFee.Zero;
             }
 
-            var security = SecurityProvider?.GetSecurity(leanOrder.Symbol);
-            if (security == null)
+            var currency = string.IsNullOrEmpty(_accountCurrency) ? walletImpact.Currency : _accountCurrency;
+            var amount = walletImpact.Taxes
+                .Where(tax => tax != null)
+                .Sum(tax => ToAccountCurrency(Math.Abs(tax.Quantity), tax.Currency, walletImpact));
+
+            return amount <= 0m ? OrderFee.Zero : new OrderFee(new CashAmount(amount, currency));
+        }
+
+        /// <summary>
+        /// Converts an amount charged in the instrument's currency into the account currency.
+        /// </summary>
+        /// <param name="amount">The amount to convert.</param>
+        /// <param name="currency">The currency the amount is charged in.</param>
+        /// <param name="walletImpact">The fill's wallet impact, carrying the FX rate.</param>
+        /// <returns>The amount in the account currency.</returns>
+        private decimal ToAccountCurrency(decimal amount, string currency, Trading212FillWalletImpact walletImpact)
+        {
+            if (amount == 0m || string.IsNullOrEmpty(_accountCurrency) || string.IsNullOrEmpty(currency)
+                || string.Equals(currency, _accountCurrency, StringComparison.OrdinalIgnoreCase))
             {
-                return OrderFee.Zero;
+                return amount;
             }
 
-            try
+            if (walletImpact.FxRate > 0m && string.Equals(currency, walletImpact.Currency, StringComparison.OrdinalIgnoreCase))
             {
-                // The fee model values a market order from the security's price, not the order's. Seed the
-                // security with the traded price when it has none yet, which happens when no data feed is
-                // driving it, so the fee is priced on the real notional instead of collapsing to zero.
-                if (security.Price <= 0m && fillPrice > 0m)
-                {
-                    // Note: Tick's three-argument (time, symbol, value) constructor is the open interest
-                    // overload, not a trade, so the fields are set explicitly.
-                    security.SetMarketPrice(new Tick
-                    {
-                        Symbol = security.Symbol,
-                        Time = DateTime.UtcNow,
-                        Value = fillPrice,
-                        TickType = TickType.Trade
-                    });
-                }
+                return amount * walletImpact.FxRate;
+            }
 
-                return new Trading212FeeModel(_accountCurrency).GetOrderFee(new OrderFeeParameters(security, leanOrder));
-            }
-            catch (Exception exception)
-            {
-                // A fee model failure must not lose the fill event.
-                Log.Error($"{nameof(Trading212Brokerage)}.{nameof(GetOrderFee)}: Could not compute the fee of order {leanOrder.Id}: {exception.Message}");
-                return OrderFee.Zero;
-            }
+            // The wallet impact carries no rate for this currency, so report the amount as charged.
+            return amount;
         }
 
         /// <summary>
@@ -1039,122 +1183,6 @@ namespace QuantConnect.Brokerages.Trading212
         private static string GetBrokerageOrderId(long orderId)
         {
             return orderId.ToString(CultureInfo.InvariantCulture);
-        }
-
-        #endregion
-
-        #region IDataQueueHandler
-
-        /// <summary>
-        /// Subscribe to the specified configuration.
-        /// </summary>
-        /// <remarks>
-        /// Trading 212's public API serves no market data, so this always returns <c>null</c>. The LEAN
-        /// launcher must be configured with <c>LiveDataQueue</c> instead.
-        /// </remarks>
-        /// <param name="dataConfig">The subscription configuration.</param>
-        /// <param name="newDataAvailableHandler">The handler fired when new data is available.</param>
-        /// <returns>Always <c>null</c>.</returns>
-        public IEnumerator<BaseData> Subscribe(SubscriptionDataConfig dataConfig, EventHandler newDataAvailableHandler)
-        {
-            if (!CanSubscribe(dataConfig.Symbol))
-            {
-                return null;
-            }
-
-            var enumerator = _aggregator.Add(dataConfig, newDataAvailableHandler);
-            _subscriptionManager.Subscribe(dataConfig);
-
-            return enumerator;
-        }
-
-        /// <summary>
-        /// Removes the specified configuration.
-        /// </summary>
-        /// <param name="dataConfig">The subscription configuration to remove.</param>
-        public void Unsubscribe(SubscriptionDataConfig dataConfig)
-        {
-            _subscriptionManager.Unsubscribe(dataConfig);
-            _aggregator?.Remove(dataConfig);
-        }
-
-        /// <summary>
-        /// Sets the job the brokerage is subscribing for.
-        /// </summary>
-        /// <remarks>
-        /// Trading 212 serves no market data, so there is nothing to subscribe to.
-        /// </remarks>
-        /// <param name="job">The job packet.</param>
-        public void SetJob(LiveNodePacket job)
-        {
-            Log.Trace($"{nameof(Trading212Brokerage)}.{nameof(SetJob)}: Trading 212 serves no market data, so there is no data subscription to set up.");
-        }
-
-        /// <summary>
-        /// Returns whether a symbol can be subscribed to.
-        /// </summary>
-        /// <remarks>
-        /// Trading 212's public API serves neither market data nor history, so no symbol can be subscribed to.
-        /// </remarks>
-        /// <param name="symbol">The symbol to check.</param>
-        /// <returns>Always <c>false</c>.</returns>
-        private bool CanSubscribe(Symbol symbol)
-        {
-            if (!_marketDataNotSupportedWarningSent)
-            {
-                _marketDataNotSupportedWarningSent = true;
-                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "MarketDataNotSupported",
-                    "Trading 212's public API does not provide market data. Configure the LEAN launcher with " +
-                    "QuantConnect.Lean.Engine.DataFeeds.Queues.LiveDataQueue to use another data source."));
-            }
-
-            return false;
-        }
-
-        /// <summary>
-        /// Adds the specified symbols to the subscription.
-        /// </summary>
-        /// <param name="symbols">The symbols to add.</param>
-        /// <returns>Always <c>false</c>, because no data is available.</returns>
-        private bool Subscribe(IEnumerable<Symbol> symbols)
-        {
-            return false;
-        }
-
-        /// <summary>
-        /// Removes the specified symbols from the subscription.
-        /// </summary>
-        /// <param name="symbols">The symbols to remove.</param>
-        /// <returns>Always <c>false</c>, because no data is available.</returns>
-        private bool Unsubscribe(IEnumerable<Symbol> symbols)
-        {
-            return false;
-        }
-
-        #endregion
-
-        #region IDataQueueUniverseProvider
-
-        /// <summary>
-        /// Returns the symbols available at the data source.
-        /// </summary>
-        /// <remarks>Trading 212 serves no data, so no symbols are available.</remarks>
-        /// <param name="symbol">The symbol to look up.</param>
-        /// <param name="includeExpired">Whether expired contracts are included.</param>
-        /// <param name="securityCurrency">The expected security currency, if any.</param>
-        /// <returns>An empty sequence.</returns>
-        public IEnumerable<Symbol> LookupSymbols(Symbol symbol, bool includeExpired, string securityCurrency = null)
-        {
-            return Enumerable.Empty<Symbol>();
-        }
-
-        /// <summary>
-        /// Returns whether selection can take place.
-        /// </summary>
-        /// <returns>Always <c>false</c>, because no data is available.</returns>
-        public bool CanPerformSelection()
-        {
-            return false;
         }
 
         #endregion
@@ -1223,20 +1251,15 @@ namespace QuantConnect.Brokerages.Trading212
         /// Validates that the current user is allowed to use this module.
         /// </summary>
         /// <remarks>
-        /// <para>
-        /// Only runs when the process carries a QuantConnect user token, which the QuantConnect cloud sets
-        /// and a local run does not. Without that guard a local or paper-account run would be terminated by
-        /// the failure path below.
-        /// </para>
-        /// <para>
-        /// TODO: QuantConnect has not assigned a product id for this module yet, so validation is skipped while
-        /// <see cref="ProductId"/> is unset. Set it to the assigned value to enable the check; the rest of the
-        /// flow is complete and matches the other brokerage plugins.
-        /// </para>
+        /// Mirrors the other brokerage plugins: the check runs unconditionally on construction and shuts the
+        /// process down when the subscription cannot be validated.
+        /// TODO: QuantConnect has not assigned a product id for this module yet, and the request cannot be
+        /// made without one, so it is skipped while <see cref="productId"/> is zero. Set it to the assigned
+        /// value to enable the check; the rest of the flow is complete.
         /// </remarks>
         private static void ValidateSubscription()
         {
-            const int ProductId = 0;
+            const int productId = 0;
 
             try
             {
@@ -1244,15 +1267,9 @@ namespace QuantConnect.Brokerages.Trading212
                 var token = Globals.UserToken;
                 var organizationId = Globals.OrganizationID;
 
-                if (string.IsNullOrEmpty(token))
+                if (productId == 0)
                 {
-                    // Local run: there is no QuantConnect cloud session to validate.
-                    return;
-                }
-
-                if (ProductId == 0)
-                {
-                    Log.Trace($"{nameof(Trading212Brokerage)}.{nameof(ValidateSubscription)}: Skipped, no product id has been assigned to this module yet.");
+                    Log.Trace($"{nameof(Trading212Brokerage)}.{nameof(ValidateSubscription)}: No product id has been assigned to this module yet, so the subscription check is skipped.");
                     return;
                 }
 
@@ -1266,7 +1283,7 @@ namespace QuantConnect.Brokerages.Trading212
                 // Compile the information we want to send when validating
                 var information = new Dictionary<string, object>
                 {
-                    { "productId", ProductId },
+                    { "productId", productId },
                     { "machineName", Environment.MachineName },
                     { "userName", Environment.UserName },
                     { "domainName", Environment.UserDomainName },

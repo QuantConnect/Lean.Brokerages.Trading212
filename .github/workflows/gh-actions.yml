@@ -24,14 +24,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v2
 
-      # The released Lean does not contain Trading212BrokerageModel yet, so the build is pinned to the
-      # fork branch that adds it (QuantConnect/Lean#9982, stacked on #9983 and #9985).
-      # TODO: switch this to `repository: QuantConnect/Lean`, `ref: master` once #9982 is merged.
-      - name: Checkout Lean
+      - name: Checkout Lean Same Branch
+        id: lean-same-branch
+        uses: actions/checkout@v2
+        continue-on-error: true
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          repository: QuantConnect/Lean
+          path: Lean
+
+      - name: Checkout Lean Master
+        if: steps.lean-same-branch.outcome != 'success'
         uses: actions/checkout@v2
         with:
-          repository: nimakalantar/Lean
-          ref: feature-9981-trading212-settlement-model
+          repository: QuantConnect/Lean
           path: Lean
 
       - name: Move Lean
@@ -43,4 +49,3 @@ jobs:
           dotnet build /p:Configuration=Release /v:quiet /p:WarningLevel=1 QuantConnect.Trading212Brokerage.sln && \
           # Run Tests
           dotnet test ./QuantConnect.Trading212Brokerage.Tests/bin/Release/QuantConnect.Brokerages.Trading212.Tests.dll
-

@@ -224,6 +224,52 @@ namespace QuantConnect.Brokerages.Trading212.Tests
         }
 
         [Test]
+        public void RetriesAPlacementAfterATooManyRequestsResponse()
+        {
+            // A 429 is the only response that is safe to retry for a placement: the request was rejected
+            // before the broker processed it.
+            _handler.EnqueueJson(HttpStatusCode.TooManyRequests, "", response => response.Headers.Add("Retry-After", "0"));
+            _handler.EnqueueJson(HttpStatusCode.OK, """{ "id": 43, "ticker": "AAPL_US_EQ", "type": "MARKET", "status": "NEW", "side": "BUY", "quantity": 1 }""");
+
+            var order = _client.PlaceMarketOrderAsync(new Trading212MarketOrderRequest { Ticker = "AAPL_US_EQ", Quantity = 1m })
+                .GetAwaiter().GetResult();
+
+            Assert.That(order.Id, Is.EqualTo(43L));
+            Assert.That(_handler.Requests, Has.Count.EqualTo(2));
+        }
+
+        [TestCase(HttpStatusCode.GatewayTimeout)]
+        [TestCase(HttpStatusCode.BadGateway)]
+        [TestCase(HttpStatusCode.ServiceUnavailable)]
+        [TestCase(HttpStatusCode.InternalServerError)]
+        [TestCase(HttpStatusCode.RequestTimeout)]
+        public void DoesNotRetryAPlacementAfterAnAmbiguousResponse(HttpStatusCode statusCode)
+        {
+            // A gateway error does not say whether the order was accepted, so retrying could place it twice.
+            _handler.EnqueueJson(statusCode, """{ "title": "upstream error" }""");
+
+            var exception = Assert.Throws<Trading212OrderPlacementException>(() =>
+                _client.PlaceMarketOrderAsync(new Trading212MarketOrderRequest { Ticker = "AAPL_US_EQ", Quantity = 1m })
+                    .GetAwaiter().GetResult());
+
+            Assert.That(exception.StatusCode, Is.EqualTo(statusCode));
+            Assert.That(_handler.Requests, Has.Count.EqualTo(1));
+        }
+
+        [Test]
+        public void RetriesAReadAfterAGatewayError()
+        {
+            // Reads are safe to repeat, so they keep the wider retry policy.
+            _handler.EnqueueJson(HttpStatusCode.BadGateway, """{ "title": "upstream error" }""");
+            _handler.EnqueueJson(HttpStatusCode.OK, Trading212TestData.AccountSummary);
+
+            var summary = _client.GetAccountSummaryAsync().GetAwaiter().GetResult();
+
+            Assert.That(summary.Currency, Is.EqualTo("GBP"));
+            Assert.That(_handler.Requests, Has.Count.EqualTo(2));
+        }
+
+        [Test]
         public void DoesNotRetryAClientError()
         {
             _handler.EnqueueJson(HttpStatusCode.BadRequest, """{ "code": "InstrumentNotFound" }""");
