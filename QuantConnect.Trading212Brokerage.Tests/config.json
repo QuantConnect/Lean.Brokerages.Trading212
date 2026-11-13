@@ -1,0 +1,8 @@
+{
+  "data-folder": "../../../../Lean/Data/",
+  "trading212-api-key": "",
+  "trading212-api-secret": "",
+  "trading212-environment": "demo",
+  "trading212-order-update-interval-seconds": 10,
+  "trading212-order-history-pages": 2
+}

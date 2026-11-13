@@ -1,0 +1,27 @@
+{
+    "name": "Trading 212",
+    "logo-url": "https://www.trading212.com/favicon.png",
+    "min-deposit": "None",
+    "description": "Trading 212 is a commission-free broker offering Invest and Stocks ISA accounts. Its Public API supports US-listed equities and ETFs with market, limit, stop and stop-limit orders.",
+    "platforms-features": [
+        {
+            "Platforms": ["Cloud Platform", "Local Platform", "LEAN CLI"],
+            "Download Data": [0, 0, 0],
+            "Backtesting": [0, 0, 0],
+            "Optimization": [0, 0, 0],
+            "Live Trading": [1, 1, 1]
+        }
+    ],
+    "order-types": ["Market", "Limit", "Stop Market", "Stop Limit"],
+    "assets": ["Equity"],
+    "brokerage-url": "https://www.trading212.com/",
+    "documentation": "/docs/v2/cloud-platform/live-trading/brokerages/trading212",
+    "module-specification": {
+        "download": {
+            "data-types": [],
+            "resolutions": [],
+            "security-types": [],
+            "markets": []
+        }
+    }
+}
